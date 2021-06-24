@@ -1,0 +1,540 @@
+---
+title: "Stan quantile divergences"
+author: "Deemah"
+date: "6/24/2021"
+output: 
+  html_document: 
+    theme: flatly
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+---
+
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.height = 5, fig.width = 7)
+library(magrittr)
+library(rstan)
+# remotes::install_github("yonicd/shredder")
+library(shredder)
+library(ggplot2)
+options(mc.cores = parallel::detectCores()-2)
+```
+
+
+```{r}
+set.seed(42)
+#claims.obs <- c(100, 950, 450) # this data is a little more difficult to fit
+claims.obs <- rexp(5, 0.5)
+gamma_a <- 7 # shape
+gamma_b <-1/0.1 # rate, which is 1/scale
+dat <- list(N = length(claims.obs), y = claims.obs, gamma_a=gamma_a, gamma_b=gamma_b)
+
+# We will be checking against the conjugate model
+post_a <-  gamma_a+length(claims.obs) 
+post_b <- gamma_b+sum(claims.obs)
+```
+
+
+# Approximation: "Clued" algebra_solver
+
+```{stan output.var="stan_mod1a_calgebra", cache=TRUE}
+functions{
+vector interpolate_v_linear(vector x, vector xs, vector ys){
+  int N =rows(x); // number of ordered!! datapoints
+  int M =rows(ys); // number of ordered!! grid cells
+  real t;
+  real w;
+  vector[N] res;
+  int i = 1;
+  // continue
+  for (j in 2:M){
+    while (x[i]<=xs[j] && x[i]>=xs[j-1] && i<=N) {
+     t = (x[i]-xs[j-1])/(xs[j]-xs[j-1]);
+     w = 1/(1 + exp(1/(1-t) - 1/t));//w = 1-t;//w = 1 - 3*pow(t,2) + 2*pow(t,3);
+     res[i] = w*ys[j-1] + (1-w)*ys[j];
+     i+=1;
+    }
+  }
+  return res;
+}
+real exponential_qf_s_cdf(real p, real lambda){
+   if (p>=1) reject("QF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QF error: lambda<=0. Encountered lambda=",lambda);
+   return -log1m(p)/lambda;
+  }
+vector exponential_qf_v_cdf(vector p, real lambda){
+   return -log1m(p)/lambda;
+  }
+real exponential_qdf_s_pdf(real p, real lambda){
+   if (p>=1) reject("QDF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QDF error: lambda<=0. Encountered lambda=",lambda);
+   return inv((lambda*(1-p)));
+  }
+vector exponential_iqf_algebra_system(vector u0, vector lambda_v, data real[] x_r, data int[] x_i){
+  return [x_r[1] - exponential_qf_s_cdf(u0[1], lambda_v[1])]';
+}
+real exponential_cdf_algebra(data real x, real u_guess, real lambda, data real rel_tol, data real f_tol, data real max_steps){
+  return algebra_solver(exponential_iqf_algebra_system, [u_guess]', [lambda]', {x}, {0},  rel_tol, f_tol, max_steps)[1];
+}
+real exponential_ldqf_s_lpdf(real p, real lambda){
+   if (lambda<=0) reject("lambda<=0, found lambda=", lambda);
+   if (p>=1) reject("p>=1, found p=",p);
+   return log(lambda)+log1m(p);
+  }
+} // end of functions block
+data {
+  int<lower=0> N;
+  vector[N] x;
+  int<lower=0> M;
+  vector[M] ys_grd;
+  real gamma_a;
+  real gamma_b;
+  real  rel_tol;
+  real f_tol;
+  real max_steps;
+  //vector[N] noise;
+}
+transformed data{
+  vector[N] x_srt = sort_asc(x);
+}
+parameters {
+  real<lower=1e-6> lambda;
+}
+transformed parameters{
+}
+model {
+  vector[N] u;
+  // prior
+  lambda ~ gamma(gamma_a, gamma_b);
+  // likelihood
+  for (i in 1:N){
+   real u_true = exponential_cdf(x_srt[i], lambda);
+   real u_guess = u_true;//+noise[i]; 
+   u[i] = exponential_cdf_algebra(x_srt[i], u_guess, lambda, rel_tol, f_tol, max_steps);
+    u[i] ~ exponential_ldqf_s(lambda);
+  }
+}
+
+
+```
+
+Let's sample:
+
+```{r, fig.show="hold", out.width="50%"}
+#ys_grd <- qpd::make_tgrid(10000, 4, 0.1)
+ys_grd <- qpd::make_pgrid(5000, 2)
+
+set.seed(42)
+#noise <- runif(length(claims.obs), -1e-16, +1e-16)
+dat_approx_calgebra <- list(N = length(claims.obs), x = claims.obs, 
+                   M=length(ys_grd), ys_grd=ys_grd, gamma_a=gamma_a, gamma_b=gamma_b, 
+                   rel_tol=1e-15, f_tol=1e-12, max_steps=100)#, noise=noise)
+
+initfun <- function() list(lambda=gamma_a/gamma_b+runif(1,1e-3,5e-3))
+
+fit_dqf_calgebra <- sampling(stan_mod1a_calgebra, data = dat_approx_calgebra, iter = 5000, 
+                             init=initfun, seed=424242, control=list(adapt_delta=0.6), refresh=0)
+d_idx <- rstan::get_divergent_iterations(fit_dqf_calgebra)
+# share of divergent
+sum(d_idx)
+```
+
+No divergences.
+
+# Approximation: "Noisy clued" algebra_solver
+
+```{stan output.var="stan_mod1a_ncalgebra", cache=TRUE}
+functions{
+vector interpolate_v_linear(vector x, vector xs, vector ys){
+  int N =rows(x); // number of ordered!! datapoints
+  int M =rows(ys); // number of ordered!! grid cells
+  real t;
+  real w;
+  vector[N] res;
+  int i = 1;
+  // continue
+  for (j in 2:M){
+    while (x[i]<=xs[j] && x[i]>=xs[j-1] && i<=N) {
+     t = (x[i]-xs[j-1])/(xs[j]-xs[j-1]);
+     w = 1/(1 + exp(1/(1-t) - 1/t));//w = 1-t;//w = 1 - 3*pow(t,2) + 2*pow(t,3);
+     res[i] = w*ys[j-1] + (1-w)*ys[j];
+     i+=1;
+    }
+  }
+  return res;
+}
+real exponential_qf_s_cdf(real p, real lambda){
+   if (p>=1) reject("QF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QF error: lambda<=0. Encountered lambda=",lambda);
+   return -log1m(p)/lambda;
+  }
+vector exponential_qf_v_cdf(vector p, real lambda){
+   return -log1m(p)/lambda;
+  }
+real exponential_qdf_s_pdf(real p, real lambda){
+   if (p>=1) reject("QDF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QDF error: lambda<=0. Encountered lambda=",lambda);
+   return inv((lambda*(1-p)));
+  }
+vector exponential_iqf_algebra_system(vector u0, vector lambda_v, data real[] x_r, data int[] x_i){
+  return [x_r[1] - exponential_qf_s_cdf(u0[1], lambda_v[1])]';
+}
+real exponential_cdf_algebra(data real x, real u_guess, real lambda, data real rel_tol, data real f_tol, data real max_steps){
+  return algebra_solver(exponential_iqf_algebra_system, [u_guess]', [lambda]', {x}, {0},  rel_tol, f_tol, max_steps)[1];
+}
+real exponential_ldqf_s_lpdf(real p, real lambda){
+   if (lambda<=0) reject("lambda<=0, found lambda=", lambda);
+   if (p>=1) reject("p>=1, found p=",p);
+   return log(lambda)+log1m(p);
+  }
+} // end of functions block
+data {
+  int<lower=0> N;
+  vector[N] x;
+  int<lower=0> M;
+  vector[M] ys_grd;
+  real gamma_a;
+  real gamma_b;
+  real  rel_tol;
+  real f_tol;
+  real max_steps;
+  vector[N] noise;
+}
+transformed data{
+  vector[N] x_srt = sort_asc(x);
+}
+parameters {
+  real<lower=1e-6> lambda;
+}
+transformed parameters{
+}
+model {
+  vector[N] u;
+  // prior
+  lambda ~ gamma(gamma_a, gamma_b);
+  // likelihood
+  for (i in 1:N){
+    real u_true = exponential_cdf(x_srt[i], lambda);
+    real u_guess = u_true+noise[i]; 
+    u[i] = exponential_cdf_algebra(x_srt[i], u_guess, lambda, rel_tol, f_tol, max_steps);
+    u[i] ~ exponential_ldqf_s(lambda);
+  }
+}
+
+
+```
+
+Let's sample:
+
+```{r, fig.show="hold", out.width="50%"}
+#ys_grd <- qpd::make_tgrid(10000, 4, 0.1)
+ys_grd <- qpd::make_pgrid(5000, 2)
+
+set.seed(42)
+noise <- runif(length(claims.obs), -1e-3, +1e-3)
+dat_approx_calgebra <- list(N = length(claims.obs), x = claims.obs, 
+                   M=length(ys_grd), ys_grd=ys_grd, gamma_a=gamma_a, gamma_b=gamma_b, 
+                   rel_tol=1e-15, f_tol=1e-12, max_steps=100, noise=noise)
+
+initfun <- function() list(lambda=gamma_a/gamma_b+runif(1,1e-3,5e-3))
+
+fit_dqf_calgebra <- sampling(stan_mod1a_ncalgebra, data = dat_approx_calgebra, iter = 5000, 
+                             init=initfun, seed=424242, control=list(adapt_delta=0.6), refresh=0)
+d_idx <- rstan::get_divergent_iterations(fit_dqf_calgebra)
+# share of divergent
+sum(d_idx)
+```
+
+Some no divergences! (we added a lot of noise). Perhaps divergences come from `algebra_solver()` hitting the `max_step` threshold and therefore the error we introduced is not being goalseeked away. Our parameters for the `algebra_system` are set at `rel_tol=1e-15` and `f_tol=1e-12` which means that the error should be under `1e-15` unless `max_step` is hit and then some error will be remaining. Let's create a parameter which will record the maximum error per one parameter sample (across datapoints). The error parameter would have to be created in `transformed parameters` block or in `generated quantities` block. In any case we would need to have access to the vector `u` which means we should move it to `transformed parameters`. 
+
+Now, we're moving the calculations block out of the `model` block and into the `transformed parameters block`. Let's just move the calculations of `u` into the `transformed parameters` block and convince ourseleves it works.
+
+# Moving calculations to transformed parameters
+
+```{stan output.var="stan_mod2a_ncalgebra", cache=TRUE}
+functions{
+vector interpolate_v_linear(vector x, vector xs, vector ys){
+  int N =rows(x); // number of ordered!! datapoints
+  int M =rows(ys); // number of ordered!! grid cells
+  real t;
+  real w;
+  vector[N] res;
+  int i = 1;
+  // continue
+  for (j in 2:M){
+    while (x[i]<=xs[j] && x[i]>=xs[j-1] && i<=N) {
+     t = (x[i]-xs[j-1])/(xs[j]-xs[j-1]);
+     w = 1/(1 + exp(1/(1-t) - 1/t));//w = 1-t;//w = 1 - 3*pow(t,2) + 2*pow(t,3);
+     res[i] = w*ys[j-1] + (1-w)*ys[j];
+     i+=1;
+    }
+  }
+  return res;
+}
+real exponential_qf_s_cdf(real p, real lambda){
+   if (p>=1) reject("QF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QF error: lambda<=0. Encountered lambda=",lambda);
+   return -log1m(p)/lambda;
+  }
+vector exponential_qf_v_cdf(vector p, real lambda){
+   return -log1m(p)/lambda;
+  }
+real exponential_qdf_s_pdf(real p, real lambda){
+   if (p>=1) reject("QDF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QDF error: lambda<=0. Encountered lambda=",lambda);
+   return inv((lambda*(1-p)));
+  }
+vector exponential_iqf_algebra_system(vector u0, vector lambda_v, data real[] x_r, data int[] x_i){
+  return [x_r[1] - exponential_qf_s_cdf(u0[1], lambda_v[1])]';
+}
+real exponential_cdf_algebra(data real x, real u_guess, real lambda, data real rel_tol, data real f_tol, data real max_steps){
+  return algebra_solver(exponential_iqf_algebra_system, [u_guess]', [lambda]', {x}, {0},  rel_tol, f_tol, max_steps)[1];
+}
+real exponential_ldqf_s_lpdf(real p, real lambda){
+   if (lambda<=0) reject("lambda<=0, found lambda=", lambda);
+   if (p>=1) reject("p>=1, found p=",p);
+   return log(lambda)+log1m(p);
+  }
+} // end of functions block
+data {
+  int<lower=0> N;
+  vector[N] x;
+  int<lower=0> M;
+  vector[M] ys_grd;
+  real gamma_a;
+  real gamma_b;
+  real  rel_tol;
+  real f_tol;
+  real max_steps;
+  vector[N] noise;
+}
+transformed data{
+  vector[N] x_srt = sort_asc(x);
+}
+parameters {
+  real<lower=1e-6> lambda;
+}
+transformed parameters{
+  vector[N] u;
+  for (i in 1:N){
+    real u_true = exponential_cdf(x_srt[i], lambda);
+    real u_guess = u_true+noise[i]; 
+    u[i] = exponential_cdf_algebra(x_srt[i], u_guess, lambda, rel_tol, f_tol, max_steps);
+  }
+}
+model {
+  // prior
+  lambda ~ gamma(gamma_a, gamma_b);
+  // likelihood
+  for (i in 1:N){
+    u[i] ~ exponential_ldqf_s(lambda);
+  }
+}
+generated quantities{
+  real err=0;
+  for (i in 1:N){
+  err = fmax(err, u[i]-exponential_cdf(x_srt[i], lambda));
+  }
+}
+```
+
+Let's sample:
+
+```{r, fig.show="hold", out.width="50%"}
+#ys_grd <- qpd::make_tgrid(10000, 4, 0.1)
+ys_grd <- qpd::make_pgrid(5000, 2)
+
+set.seed(42)
+noise <- runif(length(claims.obs), -1e-3, +1e-3)
+dat_approx_calgebra <- list(N = length(claims.obs), x = claims.obs, 
+                   M=length(ys_grd), ys_grd=ys_grd, gamma_a=gamma_a, gamma_b=gamma_b, 
+                   rel_tol=1e-15, f_tol=1e-12, max_steps=100, noise=noise)
+
+initfun <- function() list(lambda=gamma_a/gamma_b+runif(1,1e-3,5e-3))
+
+fit_dqf_calgebra <- sampling(stan_mod2a_ncalgebra, data = dat_approx_calgebra, iter = 5000, 
+                             init=initfun, seed=424242, control=list(adapt_delta=0.6), refresh=0)
+d_idx <- rstan::get_divergent_iterations(fit_dqf_calgebra)
+# share of divergent
+sum(d_idx)
+
+posterior::as_draws_df(fit_dqf_calgebra) %>% 
+  ggplot+
+  geom_histogram(aes(x=err))+
+  hrbrthemes::theme_ipsum()+
+  labs(title="Distribution of errors",
+       subtitle="Maximum difference between optimized and true value of probability")
+```
+
+No divergences!!?!?! Wait a second! We did not change a thing and amount of noise is quite high. Lets add error monitoring.
+
+Also, it does not look like `algebra_solver()` is hitting the `max_steps` threshold. That's nice! Lets add some more noise and see if we can get the divergences to re-appear. No changes to Stan code. Just re-doing the sampling
+
+```{r, fig.show="hold", out.width="50%"}
+#ys_grd <- qpd::make_tgrid(10000, 4, 0.1)
+ys_grd <- qpd::make_pgrid(5000, 2)
+
+set.seed(42)
+noise <- runif(length(claims.obs), -1e-2, +1e-2)
+dat_approx_calgebra <- list(N = length(claims.obs), x = claims.obs, 
+                   M=length(ys_grd), ys_grd=ys_grd, gamma_a=gamma_a, gamma_b=gamma_b, 
+                   rel_tol=1e-15, f_tol=1e-12, max_steps=100, noise=noise)
+
+initfun <- function() list(lambda=gamma_a/gamma_b+runif(1,1e-3,5e-3))
+
+fit_dqf_calgebra <- sampling(stan_mod2a_ncalgebra, data = dat_approx_calgebra, iter = 5000, 
+                             init=initfun, seed=424242, control=list(adapt_delta=0.6), refresh=0)
+d_idx <- rstan::get_divergent_iterations(fit_dqf_calgebra)
+# share of divergent
+sum(d_idx)
+
+posterior::as_draws_df(fit_dqf_calgebra) %>% 
+  ggplot+
+  geom_histogram(aes(x=err))+
+  hrbrthemes::theme_ipsum()+
+  labs(title="Distribution of errors",
+       subtitle="Maximum difference between optimized and true value of probability")
+```
+
+Divergences are back, but `max_steps` is still not reached. Our `algebra_system` is completing the job for every data point within 100 steps! 
+
+Couple of hypotheses:
+
+-  Divergences are not realated to the *results* of calculation at all, but rather to the *process* of calculation. 
+- Moving the calculation out of the `model` block and into the `transformed parameters` block somehow removed divergences due to *easing*(?) of calculation of the likelihood? There might be two different parts of the algorithm responsible for throwing divergences, one calculating parameter transformation and another one responsible for auto-diffing the likelihood. One is more sensitive than the other. Hence passing the calculation to another block is like giving the responsibility for the baby to the less panicing parent. Less warnings are thrown even though calculation is exactly the same.
+-  Precision of `algebra_system` has limited effect on divergences, in a sense that divergences get triggered *before* `algebra_system` loses precision. This is not to say that `max_steps` is not important, rather than our current issue with divergences are coming from a different source than the imprecision of the `algebra_system`.
+
+So far so good. Thinking back about metalog, there's no `pmetalog` available to *clue* our algorithm, so we are relying on calculation of large grid and interpolating the value. Can the interpolation be causing divergences? Lets dial back the error level to the "safe" level (`1e-06`) and then reintroduce grid calculation and interpolation *without removing the clue*, i.e. the interpolation will be calculated and **immediately discarded** not affecting the calculation. We know now that the divergences can be triggered by calculation itself, not by results.
+
+# Discarded grid
+
+```{stan output.var="stan_mod2a_ncalgebra_dgrid", cache=TRUE}
+functions{
+vector interpolate_v_linear(vector x, vector xs, vector ys){
+  int N =rows(x); // number of ordered!! datapoints
+  int M =rows(ys); // number of ordered!! grid cells
+  real t;
+  real w;
+  vector[N] res;
+  int i = 1;
+  // continue
+  for (j in 2:M){
+    while (x[i]<=xs[j] && x[i]>=xs[j-1] && i<=N) {
+     t = (x[i]-xs[j-1])/(xs[j]-xs[j-1]);
+     w = 1/(1 + exp(1/(1-t) - 1/t));//w = 1-t;//w = 1 - 3*pow(t,2) + 2*pow(t,3);
+     res[i] = w*ys[j-1] + (1-w)*ys[j];
+     i+=1;
+    }
+  }
+  return res;
+}
+real exponential_qf_s_cdf(real p, real lambda){
+   if (p>=1) reject("QF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QF error: lambda<=0. Encountered lambda=",lambda);
+   return -log1m(p)/lambda;
+  }
+vector exponential_qf_v_cdf(vector p, real lambda){
+   return -log1m(p)/lambda;
+  }
+real exponential_qdf_s_pdf(real p, real lambda){
+   if (p>=1) reject("QDF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QDF error: lambda<=0. Encountered lambda=",lambda);
+   return inv((lambda*(1-p)));
+  }
+vector exponential_iqf_algebra_system(vector u0, vector lambda_v, data real[] x_r, data int[] x_i){
+  return [x_r[1] - exponential_qf_s_cdf(u0[1], lambda_v[1])]';
+}
+real exponential_cdf_algebra(data real x, real u_guess, real lambda, data real rel_tol, data real f_tol, data real max_steps){
+  return algebra_solver(exponential_iqf_algebra_system, [u_guess]', [lambda]', {x}, {0},  rel_tol, f_tol, max_steps)[1];
+}
+real exponential_ldqf_s_lpdf(real p, real lambda){
+   if (lambda<=0) reject("lambda<=0, found lambda=", lambda);
+   if (p>=1) reject("p>=1, found p=",p);
+   return log(lambda)+log1m(p);
+  }
+} // end of functions block
+data {
+  int<lower=0> N;
+  vector[N] x;
+  int<lower=0> M;
+  vector[M] ys_grd;
+  real gamma_a;
+  real gamma_b;
+  real  rel_tol;
+  real f_tol;
+  real max_steps;
+  vector[N] noise;
+}
+transformed data{
+  vector[N] x_srt = sort_asc(x);
+}
+parameters {
+  real<lower=1e-6> lambda;
+}
+transformed parameters{
+  vector[N] u;
+  vector[N] fake_guess=interpolate_v_linear(x_srt, exponential_qf_v_cdf(ys_grd, lambda), ys_grd);
+  for (i in 1:N){
+    real u_true = exponential_cdf(x_srt[i], lambda);
+    real u_guess = u_true+noise[i]; 
+    u[i] = exponential_cdf_algebra(x_srt[i], u_guess, lambda, rel_tol, f_tol, max_steps);
+  }
+}
+model {
+  // prior
+  lambda ~ gamma(gamma_a, gamma_b);
+  // likelihood
+  for (i in 1:N){
+    u[i] ~ exponential_ldqf_s(lambda);
+  }
+}
+generated quantities{
+  real err=0;
+  for (i in 1:N){
+  err = fmax(err, u[i]-exponential_cdf(x_srt[i], lambda));
+  }
+}
+```
+
+That's it! We just added ths one line into the transformed parameters!
+
+```
+vector[N] fake_guess=interpolate_v_linear(x_srt, exponential_qf_v_cdf(ys_grd, lambda), ys_grd);
+```
+
+
+```{r, fig.show="hold", out.width="50%"}
+#ys_grd <- qpd::make_tgrid(10000, 4, 0.1)
+ys_grd <- qpd::make_pgrid(5000, 2)
+
+set.seed(42)
+noise <- runif(length(claims.obs), -1e-6, +1e-6)
+dat_approx_calgebra <- list(N = length(claims.obs), x = claims.obs, 
+                   M=length(ys_grd), ys_grd=ys_grd, gamma_a=gamma_a, gamma_b=gamma_b, 
+                   rel_tol=1e-15, f_tol=1e-12, max_steps=100, noise=noise)
+
+initfun <- function() list(lambda=gamma_a/gamma_b+runif(1,1e-3,5e-3))
+
+fit_dqf_calgebra <- sampling(stan_mod2a_ncalgebra_dgrid, data = dat_approx_calgebra, iter = 5000, 
+                             init=initfun, seed=424242, control=list(adapt_delta=0.6), refresh=0)
+d_idx <- rstan::get_divergent_iterations(fit_dqf_calgebra)
+# share of divergent
+sum(d_idx)
+
+posterior::as_draws_df(fit_dqf_calgebra) %>% 
+  ggplot+
+  geom_histogram(aes(x=err))+
+  hrbrthemes::theme_ipsum()+
+  labs(title="Distribution of errors",
+       subtitle="Maximum difference between optimized and true value of probability")
+```
+Tadah! Divergences are back. 
+
+# Conclusions
+
+Divergences are **fake news** `r emo::ji("rofl")`, at least up to a limit. The problem is that we don't know where that limit is. 
+
+My interpolation function is `r emo::ji("shit")` and needs to be rewritten.
