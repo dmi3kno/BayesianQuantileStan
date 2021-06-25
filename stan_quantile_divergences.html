@@ -278,24 +278,7 @@ post_b &lt;- gamma_b+sum(claims.obs)</code></pre>
 <div id="approximation-clued-algebra_solver" class="section level1">
 <h1>Approximation: “Clued” algebra_solver</h1>
 <pre class="stan"><code>functions{
-vector interpolate_v_linear(vector x, vector xs, vector ys){
-  int N =rows(x); // number of ordered!! datapoints
-  int M =rows(ys); // number of ordered!! grid cells
-  real t;
-  real w;
-  vector[N] res;
-  int i = 1;
-  // continue
-  for (j in 2:M){
-    while (x[i]&lt;=xs[j] &amp;&amp; x[i]&gt;=xs[j-1] &amp;&amp; i&lt;=N) {
-     t = (x[i]-xs[j-1])/(xs[j]-xs[j-1]);
-     w = 1/(1 + exp(1/(1-t) - 1/t));//w = 1-t;//w = 1 - 3*pow(t,2) + 2*pow(t,3);
-     res[i] = w*ys[j-1] + (1-w)*ys[j];
-     i+=1;
-    }
-  }
-  return res;
-}
+
 real exponential_qf_s_cdf(real p, real lambda){
    if (p&gt;=1) reject(&quot;QF error: p&gt;=1. Encountered p=&quot;,p ,&quot; with lambda=&quot;, lambda);
    if (lambda&lt;=0) reject(&quot;QF error: lambda&lt;=0. Encountered lambda=&quot;,lambda);
@@ -377,24 +360,7 @@ sum(d_idx)</code></pre>
 <div id="approximation-noisy-clued-algebra_solver" class="section level1">
 <h1>Approximation: “Noisy clued” algebra_solver</h1>
 <pre class="stan"><code>functions{
-vector interpolate_v_linear(vector x, vector xs, vector ys){
-  int N =rows(x); // number of ordered!! datapoints
-  int M =rows(ys); // number of ordered!! grid cells
-  real t;
-  real w;
-  vector[N] res;
-  int i = 1;
-  // continue
-  for (j in 2:M){
-    while (x[i]&lt;=xs[j] &amp;&amp; x[i]&gt;=xs[j-1] &amp;&amp; i&lt;=N) {
-     t = (x[i]-xs[j-1])/(xs[j]-xs[j-1]);
-     w = 1/(1 + exp(1/(1-t) - 1/t));//w = 1-t;//w = 1 - 3*pow(t,2) + 2*pow(t,3);
-     res[i] = w*ys[j-1] + (1-w)*ys[j];
-     i+=1;
-    }
-  }
-  return res;
-}
+
 real exponential_qf_s_cdf(real p, real lambda){
    if (p&gt;=1) reject(&quot;QF error: p&gt;=1. Encountered p=&quot;,p ,&quot; with lambda=&quot;, lambda);
    if (lambda&lt;=0) reject(&quot;QF error: lambda&lt;=0. Encountered lambda=&quot;,lambda);
@@ -475,30 +441,13 @@ fit_dqf_calgebra &lt;- sampling(stan_mod1a_ncalgebra, data = dat_approx_calgebra
 # share of divergent
 sum(d_idx)</code></pre>
 <pre><code>## [1] 4</code></pre>
-<p>Some no divergences! (we added a lot of noise). Perhaps divergences come from <code>algebra_solver()</code> hitting the <code>max_step</code> threshold and therefore the error we introduced is not being goalseeked away. Our parameters for the <code>algebra_system</code> are set at <code>rel_tol=1e-15</code> and <code>f_tol=1e-12</code> which means that the error should be under <code>1e-15</code> unless <code>max_step</code> is hit and then some error will be remaining. Let’s create a parameter which will record the maximum error per one parameter sample (across datapoints). The error parameter would have to be created in <code>transformed parameters</code> block or in <code>generated quantities</code> block. In any case we would need to have access to the vector <code>u</code> which means we should move it to <code>transformed parameters</code>.</p>
+<p>Some divergences! (we added a lot of noise). Perhaps divergences come from <code>algebra_solver()</code> hitting the <code>max_step</code> threshold and therefore the error we introduced is not being goalseeked away. Our parameters for the <code>algebra_system</code> are set at <code>rel_tol=1e-15</code> and <code>f_tol=1e-12</code> which means that the error should be under <code>1e-15</code> unless <code>max_step</code> is hit and then some error will be remaining. Let’s create a parameter which will record the maximum error per one parameter sample (across datapoints). The error parameter would have to be created in <code>transformed parameters</code> block or in <code>generated quantities</code> block. In any case we would need to have access to the vector <code>u</code> which means we should move it to <code>transformed parameters</code>.</p>
 <p>Now, we’re moving the calculations block out of the <code>model</code> block and into the <code>transformed parameters block</code>. Let’s just move the calculations of <code>u</code> into the <code>transformed parameters</code> block and convince ourseleves it works.</p>
 </div>
 <div id="moving-calculations-to-transformed-parameters" class="section level1">
 <h1>Moving calculations to transformed parameters</h1>
 <pre class="stan"><code>functions{
-vector interpolate_v_linear(vector x, vector xs, vector ys){
-  int N =rows(x); // number of ordered!! datapoints
-  int M =rows(ys); // number of ordered!! grid cells
-  real t;
-  real w;
-  vector[N] res;
-  int i = 1;
-  // continue
-  for (j in 2:M){
-    while (x[i]&lt;=xs[j] &amp;&amp; x[i]&gt;=xs[j-1] &amp;&amp; i&lt;=N) {
-     t = (x[i]-xs[j-1])/(xs[j]-xs[j-1]);
-     w = 1/(1 + exp(1/(1-t) - 1/t));//w = 1-t;//w = 1 - 3*pow(t,2) + 2*pow(t,3);
-     res[i] = w*ys[j-1] + (1-w)*ys[j];
-     i+=1;
-    }
-  }
-  return res;
-}
+
 real exponential_qf_s_cdf(real p, real lambda){
    if (p&gt;=1) reject(&quot;QF error: p&gt;=1. Encountered p=&quot;,p ,&quot; with lambda=&quot;, lambda);
    if (lambda&lt;=0) reject(&quot;QF error: lambda&lt;=0. Encountered lambda=&quot;,lambda);
