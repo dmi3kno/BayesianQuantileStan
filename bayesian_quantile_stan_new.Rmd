@@ -1,0 +1,629 @@
+---
+title: "Bayesian inference in quantile functions"
+author: "Deemah"
+date: "3/10/2021"
+output: 
+  html_document: 
+    toc: yes
+    toc_float: yes
+    highlight: tango
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(magrittr)
+library(rstan)
+# remotes::install_github("yonicd/shredder")
+library(shredder)
+library(ggplot2)
+options(mc.cores = parallel::detectCores()-2)
+```
+
+# Introduction
+
+The objective of this report is to investigate the nature of divergences in Stan, when approximate computation of CDF is used (in conjunction with quantile (DQF) likelihood). The goal is so understand whether divergences in fact signal challenges with exploring the posterior or they are simply false-positives driven by Stan's struggles to autodiff the implicit root-finding function.
+
+
+# Definitions
+
+**Cumulative distribution function (CDF)** denoted by $F_X(x|\theta)$ is defined as probability of the random variable $X$ being less than or equal to some given value $x$.
+$$F_X(x|\theta) = P(X \leq x|\theta)$$
+**Probability density function (PDF)**, denoted by $f_X(x)$ is such that: 
+$$f_X(x|\theta)dx=P(x\leq X \leq x+dx|\theta)=F_X(x+dx|\theta)-F_X(x|\theta)=\frac{dF_X(x|\theta)}{dx}$$
+where $dx$ is infinitesimally small range of $x$. PDF is the first derivative of CDF. The area under the PDF curve $f_X(x)$ is equal to 1.
+
+**Quantile function (QF)**, denoted by $Q_X(u|\theta)$ is related to the probability $u$ defined as $u \text{ for which } P(X \leq u|\theta)=u$. The function $Q_X(u|\theta)$ is called a *quantile function* and it expresses *u-quantile* as a function of *u*. 
+
+$$Q_X(u|\theta)=inf\{u:F_X(x|\theta)\geq u\}, \quad 0 \leq u \leq 1$$
+
+For any pair of values along the CDF $(x,u)$ it can be expressed as $x=Q(u)$ and $u=F(x)$, therefore these functions are inverses of each other $Q(u)=F^{-1}(u)$ and $F(x)=Q^{-1}(x)$. When CDF $F$ is continuous and strictly increasing (proper CDF) with quantile function $Q$, then $F(Q(u))=u$.
+
+**Quantile density function (QDF)** denoted by $q_X(u)$ is the first derivative of the Quantile Function (QF), the same way as PDF is a first derivative of CDF.
+$$q_X(u)=\frac{dQ_X(u|\theta)}{du}$$
+Because $q_X(u)$ is the slope of QF, it is non-negative on $0 \leq u \leq 1$.
+
+The advantage of quantile functions is that "quantile functions can be added and, in the right circumstances, multiplied to obtain new quantile functions. Quantile density functions can also be added together to derive new quantile density functions" [@gilchrist2000StatisticalModellingQuantile].
+
+**Density quantile function (DQF)** also known as *p-pdf* [@gilchrist2000StatisticalModellingQuantile] is, as per definition, reciprocal of $q_X(u)$. It is also representing the probability density of QF.
+
+$$f(Q(u))=\frac{dF(Q(u))}{dQ(u)} = \frac{dF(Q(u))/du}{dQ(u)/du}=\frac{dF(F^{-1}(u))/du}{q(u)}=\frac{du/du}{q(u)}=  (q(u))^{-1}$$ 
+
+Therefore:
+$$q(u)f(Q(u))=1$$
+# Bayesian inference
+
+As we show below Bayesian updating can be done in terms of quantile functions (i.e. when likelihood is expressed as quantile function instead of probability density function).
+
+## Density-defined likelihood
+
+The information about the parameter $\theta$ defined on $\theta\in A\subset\mathbb{R}$ can be described by prior distribution of random variable $\Theta$  with $F_\Theta(\theta)=v$.
+
+Let's denote the sample of $x$ (of size $n$) from $F_X(x|\theta)$ as $\underline{x}=(x_1\dots x_n)$. 
+
+The posterior density $f_\Theta(\theta|\underline{x})$ is given by:
+
+$$f_{\Theta|\underline{x}}(\theta|\underline{x})=K(\underline{x})f_X(\underline{x}|\theta)f_\Theta(\theta)$$
+where $f_X(\underline{x}|\theta)=\prod_{i=1}^{n}f_X(x_i|\theta)$ is the likelihood and $K(\underline{x})$ is the normalizing constant, given by
+$$(K(\underline{x}))^{-1}=\int_A f_X(\underline{x}|\theta)f_\Theta(\theta)d\theta$$
+
+## Quantile-defined likelihood
+
+The posterior $f_{\Theta|\underline{x}}(\theta|\underline{x})$ can be expressed in terms of quantile function $\underline{Q}(\underline{u}|\theta)$ of the sample $\underline{x}$.
+
+$$f_{\Theta|\underline{Q}}(\theta)=K(\underline{Q}(\underline{u}|\theta))f_X(\underline{Q}(\underline{u}|\theta)|\theta)f_\Theta(\theta)$$
+where $\underline{Q}=(Q_1(u_1|\theta)\dots Q_n(u_n|\theta))$ and $F(x_i|\theta)=u_i|\theta$ for $i \in (1 \dots n)$.
+
+# Example problem
+
+Let's generate synthetic data from the exponential distribution with a known parameter value. We will summarize the prior information about the parameter $\lambda$ of the exponential distribution with a Rayleigh distribution [here](https://en.wikipedia.org/wiki/Rayleigh_distribution) with parameter $\sigma$. The parameter $\sigma$ of Rayleigh distribution coincides with the mode (the most likely value). We will set the most likely value of the parameter a little away from the true value of the parameter.
+
+```{r}
+set.seed(42)
+#claims.obs <- c(100, 950, 450) # this data is a little more difficult to fit
+claims.obs <- rexp(5, 0.5)
+gamma_a <- 7 # shape
+gamma_b <-1/0.1 # rate, which is 1/scale
+dat <- list(N = length(claims.obs), y = claims.obs, gamma_a=gamma_a, gamma_b=gamma_b)
+
+# We will be checking against the conjugate model
+post_a <-  gamma_a+length(claims.obs) 
+post_b <- gamma_b+sum(claims.obs)
+```
+
+## Density-defined model
+
+Exponential CDF:
+
+$$F_{exp}(x|\lambda)=1- \exp(-\lambda x)$$
+
+Exponential PDF:
+
+$$f_{exp}(x|\lambda)=\lambda \exp(-\lambda x)$$
+
+```{stan, output.var="example_mod", cache=TRUE}
+data {
+  int<lower=0> N;
+  real<lower=0> y[N];
+  real gamma_a;
+  real gamma_b;
+}
+parameters {
+  real<lower=1e-15> lambda;
+}
+model {
+  lambda ~ gamma(gamma_a, gamma_b);
+  for (n in 1:N)
+    y[n] ~ exponential(lambda);
+}
+```
+
+```{r, fig.show="hold", out.width="50%"}
+fit_pdf <- sampling(example_mod, data = dat, iter = 5000)
+draws_df_pdf <- posterior::as_draws_df(fit_pdf) %>% 
+  posterior::rename_variables("lambda_pdf"="lambda", "lp__pdf"="lp__")
+np_pdf <- bayesplot::nuts_params(fit_pdf) %>% 
+  dplyr::mutate(model="pdf") 
+#shinystan::launch_shinystan(fit_pdf)
+pairs(fit_pdf)
+stan_dens(fit_pdf); stan_trace(fit_pdf)
+
+#check against conjugate model
+ggplot(draws_df_pdf)+
+  geom_density(aes(x=lambda_pdf, fill=1, color=1), show.legend=FALSE,  alpha=0.3)+
+  stat_function(fun = dgamma, geom = "line", args = list(shape=post_a, rate=post_b), color="red")+
+  labs(title="Gamma-Exponential model posterior density",
+       subtitle = "PDF likelihood against (conjugate density shown in red)")+
+  hrbrthemes::theme_ipsum_rc(grid=FALSE)
+
+Theta <- rstan::unconstrain_pars(fit_pdf, list(lambda=5e-3))
+myenv <- new.env()
+myenv$Theta <- Theta
+nd <- numericDeriv(quote(log_prob(fit_pdf, Theta)), "Theta", myenv)
+glp <- grad_log_prob(fit_pdf, Theta) # what Stan uses
+all.equal(as.vector(nd), attr(glp, "log_prob"))
+all.equal(as.vector(attr(nd, "gradient")), as.vector(glp))
+```
+
+## Quantile-defined model
+
+We will need to define quantile forms for [exponential distribution](https://en.wikipedia.org/wiki/Exponential_distribution). 
+
+Exponential QF: 
+$$Q_{exp}(p)=-ln(1-p)/\lambda$$ 
+
+Exponential QDF: 
+$$q(p)=1/(\lambda(1-p))$$
+
+
+Exponential DQF (reciprocal of QDF): $$f(Q(p))=(q(p))^{-1}=\lambda(1-p)$$
+
+and its log is 
+
+$$log(f(Q(p)))=log(\lambda)+log(1-p)$$.
+
+```{stan output.var="stan_mod1y", cache=TRUE}
+functions{
+  real exponential_ldqf_lpdf(real p, real lambda){
+   if (lambda<=0) reject("lambda<=0, found lambda=", lambda);
+   if (p>=1) reject("p>=1, found p=",p);
+   return log(lambda)+log1m(p);
+  }
+}
+data {
+  int<lower=0> N;
+  real<lower=0> y[N];
+  real gamma_a;
+  real gamma_b;
+}
+parameters {
+  real<lower=1e-15> lambda;
+}
+model {
+  real p[N];
+  lambda ~ gamma(gamma_a, gamma_b);
+  // transform data into probability (given parameter)
+  // likelihood
+  for (i in 1:N){
+    p[i] = exponential_cdf(y[i], lambda);
+    p[i] ~ exponential_ldqf(lambda);
+  }
+}
+```
+
+Let's sample:
+```{r, fig.show="hold", out.width="50%"}
+set.seed(42)
+initfun <- function() list(lambda=runif(1,1e-3,5e-3))
+
+fit_dqf <- sampling(stan_mod1y, data = dat, iter = 5000, init=initfun)
+draws_df_dqf <- posterior::as_draws_df(fit_dqf) %>% 
+  posterior::rename_variables("lambda_dqf"="lambda", "lp__dqf"="lp__")
+np_dqf <- bayesplot::nuts_params(fit_dqf) %>% 
+  dplyr::mutate(model="dqf") 
+#shinystan::launch_shinystan(fit_dqf)
+pairs(fit_dqf)
+stan_dens(fit_dqf); stan_trace(fit_dqf)
+
+#check against conjugate model
+ggplot(draws_df_dqf)+
+  geom_density(aes(x=lambda_dqf, fill=1, color=1), show.legend=FALSE,  alpha=0.3)+
+  stat_function(fun = dgamma, geom = "line", args = list(shape=post_a, rate=post_b), color="red")+
+  labs(title="Gamma-Exponential model posterior density",
+       subtitle = "DQF likelihood (conjugate density shown in red)")+
+  hrbrthemes::theme_ipsum_rc(grid=FALSE)
+
+d_idx <- rstan::get_divergent_iterations(fit_dqf)
+# share of divergent
+mean(d_idx)
+Theta <- rstan::unconstrain_pars(fit_dqf, list(lambda=5e-3))
+myenv <- new.env()
+myenv$Theta <- Theta
+nd <- numericDeriv(quote(log_prob(fit_dqf, Theta)), "Theta", myenv)
+glp <- grad_log_prob(fit_dqf, Theta) # what Stan uses
+all.equal(as.vector(nd), attr(glp, "log_prob"))
+all.equal(as.vector(attr(nd, "gradient")), as.vector(glp))
+```
+
+
+## Approximation: algebra_solver
+
+```{stan output.var="stan_mod1a_algebra", cache=TRUE}
+functions{
+
+// from https://discourse.mc-stan.org/t/interpolation-needs-integer-conversion/22880/4
+int find_interval_elem(real x, vector sorted, int start_ind) {
+  int res;
+  int N = num_elements(sorted);
+  int max_iter = 100 * N;
+  int left_ind = start_ind;
+  int right_ind = N;
+  real left = sorted[left_ind ] - x;
+  real right = sorted[right_ind] - x;
+  int iter = 1;
+
+  if(N == 0) return(0);
+  if(0 <= left)  return(left_ind-1);
+  if(0 == right) return(N-1);
+  if(0 >  right) return(N);
+
+  while((right_ind - left_ind) > 1  && iter != max_iter) {
+    int mid_ind;
+    real mid;
+    // is there a controlled way without being yelled at with a
+    // warning?
+    mid_ind = (left_ind + right_ind) / 2;
+    mid = sorted[mid_ind] - x;
+    if (mid == 0) return(mid_ind-1);
+    if (left  * mid < 0) { right = mid; right_ind = mid_ind; }
+    if (right * mid < 0) { left  = mid; left_ind  = mid_ind; }
+    iter = iter + 1;
+  }
+  if(iter == max_iter)
+    print("Maximum number of iterations reached.");
+  return(left_ind);
+}
+
+
+vector interpolate_v_lowest(vector x, vector xs, vector ys){
+  int N=rows(x);
+  vector[N] res;
+  int i=1;
+  for (j in 1:N){
+    i = find_interval_elem(x[j], xs, i);
+    res[j]=ys[i];
+  }
+  return res;
+}
+
+
+vector interpolate_v_linear(vector x, vector xs, vector ys){
+  int N =rows(x); // number of ordered!! datapoints
+  int M =rows(ys); // number of ordered!! grid cells
+  real t;
+  real w;
+  vector[N] res;
+  int i = 1;
+  // continue
+  for (j in 2:M){
+    while (i<=N && x[i]<=xs[j] && x[i]>=xs[j-1]) {
+     t = (x[i]-xs[j-1])/(xs[j]-xs[j-1]);
+     w = 1/(1 + exp(1/(1-t) - 1/t));//w = 1-t;//w = 1 - 3*pow(t,2) + 2*pow(t,3);
+     res[i] = w*ys[j-1] + (1-w)*ys[j];
+     i+=1;
+    }
+  }
+  return res;
+}
+real exponential_qf_s_cdf(real p, real lambda){
+   if (p>=1) reject("QF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QF error: lambda<=0. Encountered lambda=",lambda);
+   return -log1m(p)/lambda;
+  }
+vector exponential_qf_v_cdf(vector p, real lambda){
+   return -log1m(p)/lambda;
+  }
+real exponential_qdf_s_pdf(real p, real lambda){
+   if (p>=1) reject("QDF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QDF error: lambda<=0. Encountered lambda=",lambda);
+   return inv((lambda*(1-p)));
+  }
+vector exponential_iqf_algebra_system(vector u0, vector lambda_v, data real[] x_r, data int[] x_i){
+  return [x_r[1] - exponential_qf_s_cdf(u0[1], lambda_v[1])]';
+}
+real exponential_cdf_algebra(data real x, real u_guess, real lambda, data real rel_tol, data real f_tol, data real max_steps){
+  return algebra_solver(exponential_iqf_algebra_system, [u_guess]', [lambda]', {x}, {0},  rel_tol, f_tol, max_steps)[1];
+}
+real exponential_ldqf_s_lpdf(real p, real lambda){
+   if (lambda<=0) reject("lambda<=0, found lambda=", lambda);
+   if (p>=1) reject("p>=1, found p=",p);
+   return log(lambda)+log1m(p);
+  }
+} // end of functions block
+data {
+  int<lower=0> N;
+  vector[N] x;
+  int<lower=0> M;
+  vector[M] ys_grd;
+  real gamma_a;
+  real gamma_b;
+  real  rel_tol;
+  real f_tol;
+  real max_steps;
+}
+transformed data{
+  vector[N] x_srt = sort_asc(x);
+}
+parameters {
+  real<lower=1e-6> lambda;
+}
+transformed parameters{
+  vector[N] u_guess=interpolate_v_lowest(x_srt, exponential_qf_v_cdf(ys_grd, lambda), ys_grd);
+}
+model {
+  vector[N] u;
+  // prior
+  lambda ~ gamma(gamma_a, gamma_b);
+  // likelihood
+
+  for (i in 1:N){
+    u[i] = exponential_cdf_algebra(x_srt[i], u_guess[i], lambda, rel_tol, f_tol, max_steps);
+    u[i] ~ exponential_ldqf_s(lambda);
+  }
+}
+
+```
+
+Let's sample:
+
+```{r, fig.show="hold", out.width="50%"}
+#ys_grd <- qpd::make_tgrid(10000, 4, 0.1)
+ys_grd <- qpd::make_pgrid(5000, 2)
+
+dat_approx_algebra <- list(N = length(claims.obs), x = claims.obs, 
+                   M=length(ys_grd), ys_grd=ys_grd, gamma_a=gamma_a, gamma_b=gamma_b, rel_tol=1e-15, f_tol=1e-12, max_steps=100)
+
+set.seed(42)
+initfun <- function() list(lambda=gamma_a/gamma_b+runif(1,1e-3,5e-3))
+
+fit_dqf_algebra <- sampling(stan_mod1a_algebra, data = dat_approx_algebra, iter = 5000, 
+                init=initfun, seed=424242,
+                control=list(adapt_delta=0.6))
+draws_df_dqf_algebra <- posterior::as_draws_df(fit_dqf_algebra) %>% 
+  posterior::rename_variables("lambda_dqf_algebra"="lambda", "lp__dqf_algebra"="lp__")
+np_dqf_algebra <- bayesplot::nuts_params(fit_dqf_algebra) %>% 
+  dplyr::mutate(model="dqf_algebra")
+
+#check against conjugate model
+ggplot(draws_df_dqf_algebra)+
+  geom_density(aes(x=lambda_dqf_algebra, fill=1, color=1), show.legend=FALSE,  alpha=0.3)+
+  stat_function(fun = dgamma, geom = "line", args = list(shape=post_a, rate=post_b), color="red")+
+  labs(title="Gamma-Exponential model posterior density",
+       subtitle = "DQF likelihood (approx) (conjugate density shown in red)")+
+  hrbrthemes::theme_ipsum_rc(grid=FALSE)
+d_idx <- rstan::get_divergent_iterations(fit_dqf_algebra)
+# share of divergent
+mean(d_idx)
+# distribution of divergent
+np_dqf_algebra %>% 
+  dplyr::rename(".chain"="Chain", ".iteration"="Iteration", "parameter"="Parameter") %>% tidyr::pivot_wider(names_from = "parameter", values_from = "Value") %>% 
+  dplyr::select(.iteration,.chain, divergent__) %>% 
+  dplyr::left_join(draws_df_dqf_algebra, by=c(".iteration", ".chain")) %>% 
+  dplyr::select(-.draw) %>% 
+  tidyr::pivot_longer(-c(.iteration, .chain, divergent__), names_to="name") %>% 
+  tidyr::separate(name, into = c("parameter", "model"), sep="_+", extra="merge") %>% 
+  ggplot2::ggplot()+
+  ggplot2::geom_density(ggplot2::aes(x=value, fill=as.factor(divergent__), color=as.factor(divergent__)), alpha=0.1)+
+  ggplot2::facet_wrap(ggplot2::vars(parameter), scales = "free")+
+  hrbrthemes::theme_ipsum_rc(grid_col = "grey90")+
+  ggplot2::labs(title="Distribution of divergent transitions",
+                subtitle=paste("Share of divergent is ", mean(d_idx)))
+
+
+pairs(fit_dqf_algebra)
+stan_dens(fit_dqf_algebra); stan_trace(fit_dqf_algebra)
+
+Theta <- rstan::unconstrain_pars(fit_dqf_algebra, list(lambda=5e-3))
+myenv <- new.env()
+myenv$Theta <- Theta
+nd <- numericDeriv(quote(log_prob(fit_dqf_algebra, Theta)), "Theta", myenv)
+glp <- grad_log_prob(fit_dqf_algebra, Theta) # what Stan uses
+all.equal(as.vector(nd), attr(glp, "log_prob"))
+all.equal(as.vector(attr(nd, "gradient")), as.vector(glp))
+
+```
+
+## Approximation: custom
+
+```{stan output.var="stan_mod1a_custom", cache=TRUE}
+functions{
+
+// From https://discourse.mc-stan.org/t/interpolation-needs-integer-conversion/22880/4
+int find_interval_elem(real x, vector sorted, int start_ind) {
+  int res;
+  int N = num_elements(sorted);
+  int max_iter = 100 * N;
+  int left_ind = start_ind;
+  int right_ind = N;
+  real left = sorted[left_ind ] - x;
+  real right = sorted[right_ind] - x;
+  int iter = 1;
+
+  if(N == 0) return(0);
+  if(0 <= left)  return(left_ind-1);
+  if(0 == right) return(N-1);
+  if(0 >  right) return(N);
+
+  while((right_ind - left_ind) > 1  && iter != max_iter) {
+    int mid_ind;
+    real mid;
+    // is there a controlled way without being yelled at with a
+    // warning?
+    mid_ind = (left_ind + right_ind) / 2;
+    mid = sorted[mid_ind] - x;
+    if (mid == 0) return(mid_ind-1);
+    if (left  * mid < 0) { right = mid; right_ind = mid_ind; }
+    if (right * mid < 0) { left  = mid; left_ind  = mid_ind; }
+    iter = iter + 1;
+  }
+  if(iter == max_iter)
+    print("Maximum number of iterations reached.");
+  return(left_ind);
+}
+
+
+vector interpolate_v_lowest(vector x, vector xs, vector ys){
+  int N=rows(x);
+  vector[N] res;
+  int i=1;
+  for (j in 1:N){
+    i = find_interval_elem(x[j], xs, i);
+    res[j]=ys[i];
+  }
+  return res;
+}
+
+
+vector interpolate_v_linear(vector x, vector xs, vector ys){
+  int N =rows(x); // number of ordered!! datapoints
+  int M =rows(ys); // number of ordered!! grid cells
+  real t;
+  real w;
+  vector[N] res;
+  int i = 1;
+  for (j in 2:M){
+    while (i<=N && x[i]<=xs[j] && x[i]>=xs[j-1]) {
+     t = (x[i]-xs[j-1])/(xs[j]-xs[j-1]);
+     w = 1/(1 + exp(1/(1-t) - 1/t));   //w = 1-t;     //w = 1 - 3*pow(t,2) + 2*pow(t,3);
+     res[i] = w*ys[j-1] + (1-w)*ys[j];
+     i+=1;
+    }
+  }
+  return res;
+}
+real exponential_qf_s_cdf(real p, real lambda){
+   if (p>=1) reject("QF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QF error: lambda<=0. Encountered lambda=",lambda);
+   return -log1m(p)/lambda;
+  }
+vector exponential_qf_v_cdf(vector p, real lambda){// this is only used for the grid, so there should be no 1 or 0 probability
+   return -log1m(p)/lambda;
+  }
+real exponential_qdf_s_pdf(real p, real lambda){
+   if (p>=1) reject("QDF error: p>=1. Encountered p=",p ," with lambda=", lambda);
+   if (lambda<=0) reject("QDF error: lambda<=0. Encountered lambda=",lambda);
+   return inv((lambda*(1-p)));
+  }
+real exponential_s_approx_cdf(real x, real u_guess, real lambda, real tol, real max_iter){
+   int M = 1;
+   real u0 = u_guess;
+   real qu = exponential_qf_s_cdf(u0, lambda);
+   while(fabs(qu - x) > tol && M < max_iter && u0>0 && u0<1){
+    u0 += (x-qu)/exponential_qdf_s_pdf(u0, lambda);
+    if(u0>0 && u0<1) qu = exponential_qf_s_cdf(u0, lambda);
+    M+=1;
+   }
+  return fmax(fmin(u0, 1-1e-15), 0+1e-15);//u0;
+}
+real exponential_ldqf_s_lpdf(real p, real lambda){
+   if (lambda<=0) reject("lambda<=0, found lambda=", lambda);
+   if (p>=1) reject("p>=1, found p=",p);
+   return log(lambda)+log1m(p);
+  }
+} // end of functions block
+data {
+  int<lower=0> N;
+  vector[N] x;
+  int<lower=0> M;
+  vector[M] ys_grd;
+  real gamma_a;
+  real gamma_b;
+  real  tol;
+  real max_iter;
+}
+transformed data{
+  vector[N] x_srt = sort_asc(x);
+}
+parameters {
+  real<lower=1e-6> lambda;
+}
+transformed parameters{
+  vector[N] u_guess=interpolate_v_lowest(x_srt, exponential_qf_v_cdf(ys_grd, lambda), ys_grd);
+}
+
+model {
+  vector[N] u;
+  // prior
+  lambda ~ gamma(gamma_a, gamma_b);
+  // likelihood
+  for (i in 1:N){
+    u[i] = exponential_s_approx_cdf(x_srt[i], u_guess[i], lambda, tol, max_iter);
+    u[i] ~ exponential_ldqf_s(lambda);
+  }
+}
+
+```
+
+Let's sample:
+
+```{r, fig.show="hold", out.width="50%"}
+#ys_grd <- qpd::make_tgrid(10000, 4, 0.1)
+ys_grd <- qpd::make_pgrid(5000, 2)
+
+dat_approx_custom <- list(N = length(claims.obs), x = claims.obs, 
+                   M=length(ys_grd), ys_grd=ys_grd, gamma_a=gamma_a,
+                   gamma_b=gamma_b, tol=1e-15, max_iter=100)
+
+set.seed(42)
+initfun <- function() list(lambda=gamma_a/gamma_b+runif(1,1e-3,5e-3))
+
+fit_dqf_custom <- sampling(stan_mod1a_custom, data = dat_approx_custom, iter = 5000, 
+                init=initfun, seed=424242,
+                control=list(adapt_delta=0.65))
+draws_df_dqf_custom <- posterior::as_draws_df(fit_dqf_custom) %>% 
+  posterior::rename_variables("lambda_dqf_custom"="lambda", "lp__dqf_custom"="lp__")
+np_dqf_custom <- bayesplot::nuts_params(fit_dqf_custom) %>% 
+  dplyr::mutate(model="dqf_custom") 
+
+#check against conjugate model
+ggplot(draws_df_dqf_custom)+
+  geom_density(aes(x=lambda_dqf_custom, fill=1, color=1), show.legend=FALSE,  alpha=0.3)+
+  stat_function(fun = dgamma, geom = "line", args = list(shape=post_a, rate=post_b), color="red")+
+  labs(title="Gamma-Exponential model posterior density",
+       subtitle = "DQF likelihood (approx) (conjugate density shown in red)")+
+  hrbrthemes::theme_ipsum_rc(grid=FALSE)
+
+d_idx <- rstan::get_divergent_iterations(fit_dqf_custom)
+# share of divergent
+mean(d_idx)
+
+np_dqf_custom %>% 
+  dplyr::rename(".chain"="Chain", ".iteration"="Iteration", "parameter"="Parameter") %>% tidyr::pivot_wider(names_from = "parameter", values_from = "Value") %>% 
+  dplyr::select(.iteration,.chain, divergent__) %>% 
+  dplyr::left_join(draws_df_dqf_custom, by=c(".iteration", ".chain")) %>% 
+  dplyr::select(-.draw) %>% 
+  tidyr::pivot_longer(-c(.iteration, .chain, divergent__), names_to="name") %>% 
+  tidyr::separate(name, into = c("parameter", "model"), sep="_+", extra="merge") %>% 
+  ggplot2::ggplot()+
+  ggplot2::geom_density(ggplot2::aes(x=value, fill=as.factor(divergent__), color=as.factor(divergent__)), alpha=0.1)+
+  ggplot2::facet_wrap(ggplot2::vars(parameter), scales = "free")+
+  hrbrthemes::theme_ipsum_rc(grid_col = "grey90")+
+    ggplot2::labs(title="Distribution of divergent transitions",
+                subtitle=paste("Share of divergent is ", mean(d_idx)))
+
+
+pairs(fit_dqf_custom)
+stan_dens(fit_dqf_custom); stan_trace(fit_dqf_custom)
+
+Theta <- rstan::unconstrain_pars(fit_dqf_custom, list(lambda=5e-3))
+myenv <- new.env()
+myenv$Theta <- Theta
+nd <- numericDeriv(quote(log_prob(fit_dqf_custom, Theta)), "Theta", myenv)
+glp <- grad_log_prob(fit_dqf_custom, Theta) # what Stan uses
+
+all.equal(as.vector(nd), attr(glp, "log_prob"))
+all.equal(as.vector(attr(nd, "gradient")), as.vector(glp))
+
+```
+
+## Compare the posteriors
+
+```{r, fig.width=14, fig.height=5}
+posterior::bind_draws(draws_df_pdf, draws_df_dqf, draws_df_dqf_algebra, draws_df_dqf_custom) %>% 
+  dplyr::select(-.draw) %>% 
+  tidyr::pivot_longer(-c('.chain', '.iteration')) %>% 
+  tidyr::separate(name, into=c("parameter", "model"), sep="_+", extra = "merge") %>% 
+  ggplot2::ggplot()+
+  ggplot2::geom_density(ggplot2::aes(x=value, color=model, fill=model), alpha=0.1)+
+  ggplot2::facet_wrap(ggplot2::vars(parameter), scales = "free")+
+  hrbrthemes::theme_ipsum_rc(grid_col = "grey90")
+
+dplyr::bind_rows(np_pdf, np_dqf, np_dqf_algebra, np_dqf_custom) %>% 
+  setNames(c(".chain", ".iteration", "parameter", "value", "model")) %>% 
+  ggplot2::ggplot()+
+  ggplot2::geom_density(ggplot2::aes(x=value, color=model, fill=model), alpha=0.1)+
+  ggplot2::facet_wrap(ggplot2::vars(parameter), scales = "free")+
+  hrbrthemes::theme_ipsum_rc(grid_col = "grey90")
+  
+```
+
