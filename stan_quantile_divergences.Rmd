@@ -123,6 +123,11 @@ fit_dqf_calgebra <- sampling(stan_mod1a_calgebra, data = dat_approx_calgebra, it
 d_idx <- rstan::get_divergent_iterations(fit_dqf_calgebra)
 # share of divergent
 sum(d_idx)
+
+pairs(fit_dqf_calgebra)
+stan_trace(fit_dqf_calgebra)
+stan_dens(fit_dqf_calgebra)
+
 ```
 
 No divergences.
@@ -358,28 +363,59 @@ Couple of hypotheses:
 
 So far so good. Thinking back about metalog, there's no `pmetalog` available to *clue* our algorithm, so we are relying on calculation of large grid and interpolating the value. Can the interpolation be causing divergences? Lets dial back the error level to the "safe" level (`1e-06`) and then reintroduce grid calculation and interpolation *without removing the clue*, i.e. the interpolation will be calculated and **immediately discarded** not affecting the calculation. We know now that the divergences can be triggered by calculation itself, not by results.
 
-# Discarded grid
+# Mapped grid
+
+It seems like the interpolation function has been causing trouble (but I can't quite tell why). I found this really neat and simple function for matching values to the sorted grid of values (which is similar to VLOOKUP function in Excel). I am going to use it to find the lowest indices of the grid for each value of `x`. If `x` is sorted this requires a single run through the data. 
+
+So in effect our `u_guess` is the closest value from the grid of probabilities (which is lower then the value we are trying to match, so algebra_system will always search upwards).
 
 ```{stan output.var="stan_mod2a_ncalgebra_dgrid", cache=TRUE}
 functions{
-vector interpolate_v_linear(vector x, vector xs, vector ys){
-  int N =rows(x); // number of ordered!! datapoints
-  int M =rows(ys); // number of ordered!! grid cells
-  real t;
-  real w;
+
+int find_interval_elem(real x, vector sorted, int start_ind) {
+  int res;
+  int N = num_elements(sorted);
+  int max_iter = 100 * N;
+  int left_ind = start_ind;
+  int right_ind = N;
+  real left = sorted[left_ind ] - x;
+  real right = sorted[right_ind] - x;
+  int iter = 1;
+
+  if(N == 0) return(0);
+  if(0 <= left)  return(left_ind-1);
+  if(0 == right) return(N-1);
+  if(0 >  right) return(N);
+
+  while((right_ind - left_ind) > 1  && iter != max_iter) {
+    int mid_ind;
+    real mid;
+    // is there a controlled way without being yelled at with a
+    // warning?
+    mid_ind = (left_ind + right_ind) / 2;
+    mid = sorted[mid_ind] - x;
+    if (mid == 0) return(mid_ind-1);
+    if (left  * mid < 0) { right = mid; right_ind = mid_ind; }
+    if (right * mid < 0) { left  = mid; left_ind  = mid_ind; }
+    iter = iter + 1;
+  }
+  if(iter == max_iter)
+    print("Maximum number of iterations reached.");
+  return(left_ind);
+}
+
+
+vector interpolate_v_lowest(vector x, vector xs, vector ys){
+  int N=rows(x);
   vector[N] res;
-  int i = 1;
-  // continue
-  for (j in 2:M){
-    while (x[i]<=xs[j] && x[i]>=xs[j-1] && i<=N) {
-     t = (x[i]-xs[j-1])/(xs[j]-xs[j-1]);
-     w = 1/(1 + exp(1/(1-t) - 1/t));//w = 1-t;//w = 1 - 3*pow(t,2) + 2*pow(t,3);
-     res[i] = w*ys[j-1] + (1-w)*ys[j];
-     i+=1;
-    }
+  int i=1;
+  for (j in 1:N){
+    i = find_interval_elem(x[j], xs, i);
+    res[j]=ys[i];
   }
   return res;
 }
+
 real exponential_qf_s_cdf(real p, real lambda){
    if (p>=1) reject("QF error: p>=1. Encountered p=",p ," with lambda=", lambda);
    if (lambda<=0) reject("QF error: lambda<=0. Encountered lambda=",lambda);
@@ -415,7 +451,6 @@ data {
   real  rel_tol;
   real f_tol;
   real max_steps;
-  vector[N] noise;
 }
 transformed data{
   vector[N] x_srt = sort_asc(x);
@@ -423,67 +458,52 @@ transformed data{
 parameters {
   real<lower=1e-6> lambda;
 }
-transformed parameters{
-  vector[N] u;
-  vector[N] fake_guess=interpolate_v_linear(x_srt, exponential_qf_v_cdf(ys_grd, lambda), ys_grd);
-  for (i in 1:N){
-    real u_true = exponential_cdf(x_srt[i], lambda);
-    real u_guess = u_true+noise[i]; 
-    u[i] = exponential_cdf_algebra(x_srt[i], u_guess, lambda, rel_tol, f_tol, max_steps);
-  }
-}
 model {
+  vector[N] u;
+  vector[N] u_guess=interpolate_v_lowest(x_srt, exponential_qf_v_cdf(ys_grd, lambda), ys_grd);
   // prior
   lambda ~ gamma(gamma_a, gamma_b);
   // likelihood
   for (i in 1:N){
+    u[i] = exponential_cdf_algebra(x_srt[i], u_guess[i], lambda, rel_tol, f_tol, max_steps);
     u[i] ~ exponential_ldqf_s(lambda);
   }
 }
-generated quantities{
-  real err=0;
-  for (i in 1:N){
-  err = fmax(err, u[i]-exponential_cdf(x_srt[i], lambda));
-  }
-}
 ```
 
-That's it! We just added ths one line into the transformed parameters!
-
-```
-vector[N] fake_guess=interpolate_v_linear(x_srt, exponential_qf_v_cdf(ys_grd, lambda), ys_grd);
-```
-
+And we sample. I removed the generated quantities since we convinced ourseleves that the algebra_system is doing a good job. With large enough grid our approximation should not be too far off. I am using grid-making function from the `qpd` package which basically takes equi-spaced samples from the beta distribution.
 
 ```{r, fig.show="hold", out.width="50%"}
 #ys_grd <- qpd::make_tgrid(10000, 4, 0.1)
 ys_grd <- qpd::make_pgrid(5000, 2)
 
 set.seed(42)
-noise <- runif(length(claims.obs), -1e-6, +1e-6)
+#noise <- runif(length(claims.obs), -1e-6, +1e-6)
 dat_approx_calgebra <- list(N = length(claims.obs), x = claims.obs, 
                    M=length(ys_grd), ys_grd=ys_grd, gamma_a=gamma_a, gamma_b=gamma_b, 
-                   rel_tol=1e-15, f_tol=1e-12, max_steps=100, noise=noise)
+                   rel_tol=1e-15, f_tol=1e-12, max_steps=100)
 
 initfun <- function() list(lambda=gamma_a/gamma_b+runif(1,1e-3,5e-3))
 
 fit_dqf_calgebra <- sampling(stan_mod2a_ncalgebra_dgrid, data = dat_approx_calgebra, iter = 5000, 
                              init=initfun, seed=424242, control=list(adapt_delta=0.6), refresh=0)
+
 d_idx <- rstan::get_divergent_iterations(fit_dqf_calgebra)
 # share of divergent
 sum(d_idx)
 
-posterior::as_draws_df(fit_dqf_calgebra) %>% 
-  ggplot+
-  geom_histogram(aes(x=err))+
-  hrbrthemes::theme_ipsum()+
-  labs(title="Distribution of errors",
-       subtitle="Maximum difference between optimized and true value of probability")
+pairs(fit_dqf_calgebra)
+stan_trace(fit_dqf_calgebra)
+stan_dens(fit_dqf_calgebra)
+
 ```
-Tadah! Divergences are back. 
+
+Tadah! No divergences!
 
 # Conclusions
 
-Divergences are **fake news** `r emo::ji("rofl")`, at least up to a limit. The problem is that we don't know where that limit is. 
+[Step-like functions](https://mc-stan.org/docs/2_27/functions-reference/step-functions.html) are causing divergences and messing up NUTS sampler regardless of whether they participate in the likelihood calculation or not. 
 
-My interpolation function is `r emo::ji("shit")` and needs to be rewritten.
+> Warning: These functions can seriously hinder sampling andoptimization efficiency for gradient-based methods (e.g., NUTS, HMC,BFGS) if applied to parameters (including transformed parameters andlocal variables in the transformed parameters or model block). Theproblem is that they break gradients due to discontinuities coupledwith zero gradients elsewhere. They do not hinder sampling whenused in the data, transformed data, or generated quantities blocks.
+
+One should always check if the newly built function will introduce divergences just by being present in the `transformed parameters` block. If it is safe there, it can probably can be wired up and later moved to `model` block if tracking of parameters is not important.
