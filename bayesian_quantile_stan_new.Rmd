@@ -230,52 +230,22 @@ all.equal(as.vector(attr(nd, "gradient")), as.vector(glp))
 
 ```{stan output.var="stan_mod1a_algebra", cache=TRUE}
 functions{
-
-// from https://discourse.mc-stan.org/t/interpolation-needs-integer-conversion/22880/4
-int find_interval_elem(real x, vector sorted, int start_ind) {
-  int res;
-  int N = num_elements(sorted);
-  int max_iter = 100 * N;
-  int left_ind = start_ind;
-  int right_ind = N;
-  real left = sorted[left_ind ] - x;
-  real right = sorted[right_ind] - x;
-  int iter = 1;
-
-  if(N == 0) return(0);
-  if(0 <= left)  return(left_ind-1);
-  if(0 == right) return(N-1);
-  if(0 >  right) return(N);
-
-  while((right_ind - left_ind) > 1  && iter != max_iter) {
-    int mid_ind;
-    real mid;
-    // is there a controlled way without being yelled at with a
-    // warning?
-    mid_ind = (left_ind + right_ind) / 2;
-    mid = sorted[mid_ind] - x;
-    if (mid == 0) return(mid_ind-1);
-    if (left  * mid < 0) { right = mid; right_ind = mid_ind; }
-    if (right * mid < 0) { left  = mid; left_ind  = mid_ind; }
-    iter = iter + 1;
-  }
-  if(iter == max_iter)
-    print("Maximum number of iterations reached.");
-  return(left_ind);
-}
-
-
-vector interpolate_v_lowest(vector x, vector xs, vector ys){
-  int N=rows(x);
+//  //given x and a grid, returns a linearly interpolated y
+vector interpolate_v_lower(vector x, vector xs, vector ys){
+  int N =rows(x); // number of ordered!! datapoints
+  int M =rows(xs); // number of ordered!! grid cells
+  real t;
+  real w;
   vector[N] res;
-  int i=1;
-  for (j in 1:N){
-    i = find_interval_elem(x[j], xs, i);
-    res[j]=ys[i];
+  int i = 1;
+  for (j in 2:M){
+    while (i<=N && x[i]<=xs[j] && x[i]>=xs[j-1]) {
+     res[i] = ys[j-1];
+     i+=1;
+    }
   }
   return res;
 }
-
 
 vector interpolate_v_linear(vector x, vector xs, vector ys){
   int N =rows(x); // number of ordered!! datapoints
@@ -338,7 +308,7 @@ parameters {
   real<lower=1e-6> lambda;
 }
 transformed parameters{
-  vector[N] u_guess=interpolate_v_lowest(x_srt, exponential_qf_v_cdf(ys_grd, lambda), ys_grd);
+  vector[N] u_guess=interpolate_v_lower(x_srt, exponential_qf_v_cdf(ys_grd, lambda), ys_grd);
 }
 model {
   vector[N] u;
@@ -417,52 +387,22 @@ all.equal(as.vector(attr(nd, "gradient")), as.vector(glp))
 
 ```{stan output.var="stan_mod1a_custom", cache=TRUE}
 functions{
-
-// From https://discourse.mc-stan.org/t/interpolation-needs-integer-conversion/22880/4
-int find_interval_elem(real x, vector sorted, int start_ind) {
-  int res;
-  int N = num_elements(sorted);
-  int max_iter = 100 * N;
-  int left_ind = start_ind;
-  int right_ind = N;
-  real left = sorted[left_ind ] - x;
-  real right = sorted[right_ind] - x;
-  int iter = 1;
-
-  if(N == 0) return(0);
-  if(0 <= left)  return(left_ind-1);
-  if(0 == right) return(N-1);
-  if(0 >  right) return(N);
-
-  while((right_ind - left_ind) > 1  && iter != max_iter) {
-    int mid_ind;
-    real mid;
-    // is there a controlled way without being yelled at with a
-    // warning?
-    mid_ind = (left_ind + right_ind) / 2;
-    mid = sorted[mid_ind] - x;
-    if (mid == 0) return(mid_ind-1);
-    if (left  * mid < 0) { right = mid; right_ind = mid_ind; }
-    if (right * mid < 0) { left  = mid; left_ind  = mid_ind; }
-    iter = iter + 1;
-  }
-  if(iter == max_iter)
-    print("Maximum number of iterations reached.");
-  return(left_ind);
-}
-
-
-vector interpolate_v_lowest(vector x, vector xs, vector ys){
-  int N=rows(x);
+//  //given x and a grid, returns a linearly interpolated y
+vector interpolate_v_lower(vector x, vector xs, vector ys){
+  int N =rows(x); // number of ordered!! datapoints
+  int M =rows(xs); // number of ordered!! grid cells
+  real t;
+  real w;
   vector[N] res;
-  int i=1;
-  for (j in 1:N){
-    i = find_interval_elem(x[j], xs, i);
-    res[j]=ys[i];
+  int i = 1;
+  for (j in 2:M){
+    while (i<=N && x[i]<=xs[j] && x[i]>=xs[j-1]) {
+     res[i] = ys[j-1];
+     i+=1;
+    }
   }
   return res;
 }
-
 
 vector interpolate_v_linear(vector x, vector xs, vector ys){
   int N =rows(x); // number of ordered!! datapoints
@@ -528,7 +468,7 @@ parameters {
   real<lower=1e-6> lambda;
 }
 transformed parameters{
-  vector[N] u_guess=interpolate_v_lowest(x_srt, exponential_qf_v_cdf(ys_grd, lambda), ys_grd);
+  vector[N] u_guess=interpolate_v_lower(x_srt, exponential_qf_v_cdf(ys_grd, lambda), ys_grd);
 }
 
 model {
